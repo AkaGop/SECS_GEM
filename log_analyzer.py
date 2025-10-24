@@ -40,11 +40,25 @@ def parse_log_file(uploaded_file) -> pd.DataFrame:
 def clean_data(df: pd.DataFrame) -> pd.DataFrame:
     """Cleans and transforms the DataFrame columns for analysis."""
     df['timestamp'] = pd.to_datetime(df['timestamp'])
+    
+    # Convert numeric columns, coercing errors to NaN
     if 'TransactionID' in df.columns:
         df['TransactionID'] = pd.to_numeric(df['TransactionID'], errors='coerce')
+    
+    # Extract Process Time
     if 'Message' in df.columns:
         time_pattern = r"Process time of the transaction\(ID=\d+\) is ([\d.]+) msec"
         df['ProcessTime_ms'] = df['Message'].str.extract(time_pattern, expand=False).astype(float)
+        
+    # --- NEW LOGIC TO FIX THE ANOMALY ---
+    # Propagate 'MessageName' to all rows within the same transaction group.
+    # We sort by timestamp first to ensure forward-fill works correctly.
+    if 'TransactionID' in df.columns and 'MessageName' in df.columns:
+        df = df.sort_values(by=['TransactionID', 'timestamp'])
+        # ffill() fills forward, bfill() fills backward. Doing both ensures all rows in a group get the value.
+        df['MessageName'] = df.groupby('TransactionID')['MessageName'].ffill().bfill()
+        print("Propagated MessageName across transaction groups.")
+        
     return df
 
 def get_summary_statistics(df: pd.DataFrame) -> dict:
