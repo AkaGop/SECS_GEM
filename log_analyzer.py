@@ -1,142 +1,44 @@
-import re
-import pandas as pd
-import matplotlib.pyplot as plt
-import seaborn as sns
+# --- ADD THIS NEW FUNCTION to log_analyzer.py ---
 
-def parse_log_file(uploaded_file) -> pd.DataFrame:
+def detect_performance_anomalies(df: pd.DataFrame) -> pd.DataFrame:
     """
-    Parses an uploaded SECS/GEM log file and returns a structured DataFrame.
+    Identifies performance anomalies using the IQR method.
+
+    An anomaly is a data point that falls above Q3 + 1.5 * IQR.
+
+    Args:
+        df (pd.DataFrame): The input DataFrame.
+
+    Returns:
+        pd.DataFrame: A DataFrame containing only the anomalous log entries, or an empty DataFrame if none are found.
     """
-    log_pattern = re.compile(
-        r'^(?P<timestamp>\d{4}/\d{2}/\d{2}\s\d{2}:\d{2}:\d{2}\.\d{6}),'
-        r'\[(?P<log_type>[^\]]+)\],'
-        r'(?P<details>.*)$'
-    )
-    # This improved pattern handles values that contain spaces
-    details_pattern = re.compile(r'(\w+)=(".*?"|\S+)')
-
-    parsed_data = []
-    for line in uploaded_file.getvalue().decode("utf-8").splitlines():
-        match = log_pattern.match(line.strip())
-        if match:
-            log_entry = match.groupdict()
-            # A more robust way to parse key-value pairs
-            details_str = log_entry['details']
-            pairs = re.split(r'(\w+=)', details_str)[1:]
-            details = dict(zip(pairs[0::2], pairs[1::2]))
-            # Clean up the keys and values
-            details_cleaned = {k.replace('=', ''): v.strip() for k, v in details.items()}
-            
-            log_entry.update(details_cleaned)
-            del log_entry['details']
-            parsed_data.append(log_entry)
-
-    if not parsed_data:
-        return pd.DataFrame()
-
-    df = pd.DataFrame(parsed_data)
-    return clean_data(df)
-
-def clean_data(df: pd.DataFrame) -> pd.DataFrame:
-    """Cleans and transforms the DataFrame columns for analysis."""
-    df['timestamp'] = pd.to_datetime(df['timestamp'])
-    
-    # Convert numeric columns, coercing errors to NaN
-    if 'TransactionID' in df.columns:
-        df['TransactionID'] = pd.to_numeric(df['TransactionID'], errors='coerce')
-    
-    # Extract Process Time
-    if 'Message' in df.columns:
-        time_pattern = r"Process time of the transaction\(ID=\d+\) is ([\d.]+) msec"
-        df['ProcessTime_ms'] = df['Message'].str.extract(time_pattern, expand=False).astype(float)
-        
-    # --- NEW LOGIC TO FIX THE ANOMALY ---
-    # Propagate 'MessageName' to all rows within the same transaction group.
-    # We sort by timestamp first to ensure forward-fill works correctly.
-    if 'TransactionID' in df.columns and 'MessageName' in df.columns:
-        df = df.sort_values(by=['TransactionID', 'timestamp'])
-        # ffill() fills forward, bfill() fills backward. Doing both ensures all rows in a group get the value.
-        df['MessageName'] = df.groupby('TransactionID')['MessageName'].ffill().bfill()
-        print("Propagated MessageName across transaction groups.")
-        
-    return df
-
-def get_summary_statistics(df: pd.DataFrame) -> dict:
-    """Returns a dictionary of high-level summary statistics."""
-    if df.empty:
-        return {}
-    duration = df['timestamp'].max() - df['timestamp'].min()
-    return {
-        "Total Entries": len(df),
-        "Start Time": df['timestamp'].min(),
-        "End Time": df['timestamp'].max(),
-        "Duration": duration
-    }
-
-def analyze_transaction_performance(df: pd.DataFrame):
-    """
-    Analyzes transaction process times. Returns stats and a figure if data is available.
-    """
-    # --- DEFENSIVE CHECK ---
-    # Check if the required columns exist.
     required_cols = ['ProcessTime_ms', 'MessageName']
     if not all(col in df.columns for col in required_cols):
-        return None, None
+        return pd.DataFrame() # Return empty if columns don't exist
 
     perf_df = df.dropna(subset=required_cols)
     if perf_df.empty:
-        return None, None
-    
-    performance_stats = perf_df.groupby('MessageName')['ProcessTime_ms'].describe()
-    
-    fig, ax = plt.subplots(figsize=(12, 8))
-    sns.boxplot(ax=ax, data=perf_df, x='ProcessTime_ms', y='MessageName', 
-                order=performance_stats.sort_values('median', ascending=False).index)
-    ax.set_title('Distribution of Process Times by Message Name')
-    ax.set_xlabel('Process Time (ms)')
-    ax.set_ylabel('Message Name')
-    ax.set_xscale('log')
-    plt.tight_layout()
-    
-    return performance_stats, fig
+        return pd.DataFrame()
 
-def analyze_event_frequency(df: pd.DataFrame):
-    """
-    Analyzes message frequency. Returns counts and a figure if data is available.
-    """
-    # --- DEFENSIVE CHECK ---
-    if 'MessageName' not in df.columns:
-        return None, None
+    # Group by message name to calculate anomalies for each type of transaction
+    anomalies = []
+    for name, group in perf_df.groupby('MessageName'):
+        q1 = group['ProcessTime_ms'].quantile(0.25)
+        q3 = group['ProcessTime_ms'].quantile(0.75)
+        iqr = q3 - q1
         
-    top_10_messages = df['MessageName'].value_counts().nlargest(10)
-    
-    fig, ax = plt.subplots(figsize=(12, 8))
-    sns.barplot(ax=ax, y=top_10_messages.index, x=top_10_messages.values, orient='h')
-    ax.set_title('Top 10 Most Frequent Message Names')
-    ax.set_xlabel('Count')
-    ax.set_ylabel('Message Name')
-    plt.tight_layout()
-    
-    return top_10_messages, fig
+        # Define the upper bound for outlier detection
+        upper_bound = q3 + (1.5 * iqr)
+        
+        # Find all data points in the group that are above the upper bound
+        group_anomalies = group[group['ProcessTime_ms'] > upper_bound]
+        
+        if not group_anomalies.empty:
+            anomalies.append(group_anomalies)
 
-def analyze_transaction_lifecycle(df: pd.DataFrame) -> dict:
-    """Finds transactions that were started but never completed."""
-    # --- DEFENSIVE CHECK ---
-    required_cols = ['Message', 'TransactionID']
-    if not all(col in df.columns for col in required_cols):
-        return {"error": "Lifecycle analysis requires 'Message' and 'TransactionID' columns."}
-        
-    added = df[df['Message'].str.contains("added to", na=False)]
-    deleted = df[df['Message'].str.contains("deleted from", na=False)]
+    if not anomalies:
+        return pd.DataFrame()
     
-    added_ids = set(added['TransactionID'].dropna().unique())
-    deleted_ids = set(deleted['TransactionID'].dropna().unique())
-    
-    orphaned_ids = added_ids - deleted_ids
-    
-    return {
-        "initiated": len(added_ids),
-        "completed": len(deleted_ids),
-        "orphaned_count": len(orphaned_ids),
-        "orphaned_ids": sorted(list(orphaned_ids))
-    }
+    # Combine all found anomalies into a single DataFrame and sort by time
+    anomalies_df = pd.concat(anomalies).sort_values(by='timestamp')
+    return anomalies_df
