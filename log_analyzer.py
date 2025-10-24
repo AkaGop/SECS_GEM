@@ -12,16 +12,22 @@ def parse_log_file(uploaded_file) -> pd.DataFrame:
         r'\[(?P<log_type>[^\]]+)\],'
         r'(?P<details>.*)$'
     )
-    details_pattern = re.compile(r'(\w+)=([^,]+(?:\s[^,]+)*)')
+    # This improved pattern handles values that contain spaces
+    details_pattern = re.compile(r'(\w+)=(".*?"|\S+)')
 
     parsed_data = []
-    # Read from the uploaded file's in-memory buffer
     for line in uploaded_file.getvalue().decode("utf-8").splitlines():
         match = log_pattern.match(line.strip())
         if match:
             log_entry = match.groupdict()
-            details = dict(details_pattern.findall(log_entry['details']))
-            log_entry.update(details)
+            # A more robust way to parse key-value pairs
+            details_str = log_entry['details']
+            pairs = re.split(r'(\w+=)', details_str)[1:]
+            details = dict(zip(pairs[0::2], pairs[1::2]))
+            # Clean up the keys and values
+            details_cleaned = {k.replace('=', ''): v.strip() for k, v in details.items()}
+            
+            log_entry.update(details_cleaned)
             del log_entry['details']
             parsed_data.append(log_entry)
 
@@ -38,7 +44,7 @@ def clean_data(df: pd.DataFrame) -> pd.DataFrame:
         df['TransactionID'] = pd.to_numeric(df['TransactionID'], errors='coerce')
     if 'Message' in df.columns:
         time_pattern = r"Process time of the transaction\(ID=\d+\) is ([\d.]+) msec"
-        df['ProcessTime_ms'] = df['Message'].str.extract(time_pattern).astype(float)
+        df['ProcessTime_ms'] = df['Message'].str.extract(time_pattern, expand=False).astype(float)
     return df
 
 def get_summary_statistics(df: pd.DataFrame) -> dict:
@@ -54,14 +60,21 @@ def get_summary_statistics(df: pd.DataFrame) -> dict:
     }
 
 def analyze_transaction_performance(df: pd.DataFrame):
-    """Analyzes transaction process times and returns stats and a figure."""
-    perf_df = df.dropna(subset=['ProcessTime_ms', 'MessageName'])
+    """
+    Analyzes transaction process times. Returns stats and a figure if data is available.
+    """
+    # --- DEFENSIVE CHECK ---
+    # Check if the required columns exist.
+    required_cols = ['ProcessTime_ms', 'MessageName']
+    if not all(col in df.columns for col in required_cols):
+        return None, None
+
+    perf_df = df.dropna(subset=required_cols)
     if perf_df.empty:
         return None, None
     
     performance_stats = perf_df.groupby('MessageName')['ProcessTime_ms'].describe()
     
-    # Visualization
     fig, ax = plt.subplots(figsize=(12, 8))
     sns.boxplot(ax=ax, data=perf_df, x='ProcessTime_ms', y='MessageName', 
                 order=performance_stats.sort_values('median', ascending=False).index)
@@ -74,13 +87,15 @@ def analyze_transaction_performance(df: pd.DataFrame):
     return performance_stats, fig
 
 def analyze_event_frequency(df: pd.DataFrame):
-    """Analyzes the frequency of messages and returns counts and a figure."""
-    if df.empty or 'MessageName' not in df.columns:
+    """
+    Analyzes message frequency. Returns counts and a figure if data is available.
+    """
+    # --- DEFENSIVE CHECK ---
+    if 'MessageName' not in df.columns:
         return None, None
         
     top_10_messages = df['MessageName'].value_counts().nlargest(10)
     
-    # Visualization
     fig, ax = plt.subplots(figsize=(12, 8))
     sns.barplot(ax=ax, y=top_10_messages.index, x=top_10_messages.values, orient='h')
     ax.set_title('Top 10 Most Frequent Message Names')
@@ -92,7 +107,9 @@ def analyze_event_frequency(df: pd.DataFrame):
 
 def analyze_transaction_lifecycle(df: pd.DataFrame) -> dict:
     """Finds transactions that were started but never completed."""
-    if 'Message' not in df.columns or 'TransactionID' not in df.columns:
+    # --- DEFENSIVE CHECK ---
+    required_cols = ['Message', 'TransactionID']
+    if not all(col in df.columns for col in required_cols):
         return {"error": "Lifecycle analysis requires 'Message' and 'TransactionID' columns."}
         
     added = df[df['Message'].str.contains("added to", na=False)]
