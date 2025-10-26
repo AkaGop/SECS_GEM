@@ -1,186 +1,173 @@
-import re
-import pandas as pd
-import matplotlib.pyplot as plt
-import seaborn as sns
+# ... (all existing functions from the previous step remain here) ...
 
-def parse_log_file(uploaded_file) -> pd.DataFrame:
+# --- ADD THESE TWO NEW FUNCTIONS ---
+
+def analyze_alarms(df: pd.DataFrame):
     """
-    Parses an uploaded SECS/GEM log file and returns a structured DataFrame.
-    """
-    log_pattern = re.compile(
-        r'^(?P<timestamp>\d{4}/\d{2}/\d{2}\s\d{2}:\d{2}:\d{2}\.\d{6}),'
-        r'\[(?P<log_type>[^\]]+)\],'
-        r'(?P<details>.*)$'
-    )
-    # This improved pattern handles values that contain spaces
-    details_pattern = re.compile(r'(\w+)=(".*?"|\S+)')
-
-    parsed_data = []
-    for line in uploaded_file.getvalue().decode("utf-8").splitlines():
-        match = log_pattern.match(line.strip())
-        if match:
-            log_entry = match.groupdict()
-            # A more robust way to parse key-value pairs
-            details_str = log_entry['details']
-            pairs = re.split(r'(\w+=)', details_str)[1:]
-            details = dict(zip(pairs[0::2], pairs[1::2]))
-            # Clean up the keys and values
-            details_cleaned = {k.replace('=', ''): v.strip() for k, v in details.items()}
-            
-            log_entry.update(details_cleaned)
-            del log_entry['details']
-            parsed_data.append(log_entry)
-
-    if not parsed_data:
-        return pd.DataFrame()
-
-    df = pd.DataFrame(parsed_data)
-    return clean_data(df)
-
-def clean_data(df: pd.DataFrame) -> pd.DataFrame:
-    """Cleans and transforms the DataFrame columns for analysis."""
-    df['timestamp'] = pd.to_datetime(df['timestamp'])
-    
-    # Convert numeric columns, coercing errors to NaN
-    if 'TransactionID' in df.columns:
-        df['TransactionID'] = pd.to_numeric(df['TransactionID'], errors='coerce')
-    
-    # Extract Process Time
-    if 'Message' in df.columns:
-        time_pattern = r"Process time of the transaction\(ID=\d+\) is ([\d.]+) msec"
-        df['ProcessTime_ms'] = df['Message'].str.extract(time_pattern, expand=False).astype(float)
-        
-    # --- NEW LOGIC TO FIX THE ANOMALY ---
-    # Propagate 'MessageName' to all rows within the same transaction group.
-    # We sort by timestamp first to ensure forward-fill works correctly.
-    if 'TransactionID' in df.columns and 'MessageName' in df.columns:
-        df = df.sort_values(by=['TransactionID', 'timestamp'])
-        # ffill() fills forward, bfill() fills backward. Doing both ensures all rows in a group get the value.
-        df['MessageName'] = df.groupby('TransactionID')['MessageName'].ffill().bfill()
-        print("Propagated MessageName across transaction groups.")
-        
-    return df
-
-def get_summary_statistics(df: pd.DataFrame) -> dict:
-    """Returns a dictionary of high-level summary statistics."""
-    if df.empty:
-        return {}
-    duration = df['timestamp'].max() - df['timestamp'].min()
-    return {
-        "Total Entries": len(df),
-        "Start Time": df['timestamp'].min(),
-        "End Time": df['timestamp'].max(),
-        "Duration": duration
-    }
-
-def analyze_transaction_performance(df: pd.DataFrame):
-    """
-    Analyzes transaction process times. Returns stats and a figure if data is available.
-    """
-    # --- DEFENSIVE CHECK ---
-    # Check if the required columns exist.
-    required_cols = ['ProcessTime_ms', 'MessageName']
-    if not all(col in df.columns for col in required_cols):
-        return None, None
-
-    perf_df = df.dropna(subset=required_cols)
-    if perf_df.empty:
-        return None, None
-    
-    performance_stats = perf_df.groupby('MessageName')['ProcessTime_ms'].describe()
-    
-    fig, ax = plt.subplots(figsize=(12, 8))
-    sns.boxplot(ax=ax, data=perf_df, x='ProcessTime_ms', y='MessageName', 
-                order=performance_stats.sort_values('median', ascending=False).index)
-    ax.set_title('Distribution of Process Times by Message Name')
-    ax.set_xlabel('Process Time (ms)')
-    ax.set_ylabel('Message Name')
-    ax.set_xscale('log')
-    plt.tight_layout()
-    
-    return performance_stats, fig
-
-def analyze_event_frequency(df: pd.DataFrame):
-    """
-    Analyzes message frequency. Returns counts and a figure if data is available.
-    """
-    # --- DEFENSIVE CHECK ---
-    if 'MessageName' not in df.columns:
-        return None, None
-        
-    top_10_messages = df['MessageName'].value_counts().nlargest(10)
-    
-    fig, ax = plt.subplots(figsize=(12, 8))
-    sns.barplot(ax=ax, y=top_10_messages.index, x=top_10_messages.values, orient='h')
-    ax.set_title('Top 10 Most Frequent Message Names')
-    ax.set_xlabel('Count')
-    ax.set_ylabel('Message Name')
-    plt.tight_layout()
-    
-    return top_10_messages, fig
-
-def analyze_transaction_lifecycle(df: pd.DataFrame) -> dict:
-    """Finds transactions that were started but never completed."""
-    # --- DEFENSIVE CHECK ---
-    required_cols = ['Message', 'TransactionID']
-    if not all(col in df.columns for col in required_cols):
-        return {"error": "Lifecycle analysis requires 'Message' and 'TransactionID' columns."}
-        
-    added = df[df['Message'].str.contains("added to", na=False)]
-    deleted = df[df['Message'].str.contains("deleted from", na=False)]
-    
-    added_ids = set(added['TransactionID'].dropna().unique())
-    deleted_ids = set(deleted['TransactionID'].dropna().unique())
-    
-    orphaned_ids = added_ids - deleted_ids
-    
-    return {
-        "initiated": len(added_ids),
-        "completed": len(deleted_ids),
-        "orphaned_count": len(orphaned_ids),
-        "orphaned_ids": sorted(list(orphaned_ids))
-    }
-# --- ADD THIS NEW FUNCTION to log_analyzer.py ---
-
-def detect_performance_anomalies(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Identifies performance anomalies using the IQR method.
-
-    An anomaly is a data point that falls above Q3 + 1.5 * IQR.
-
-    Args:
-        df (pd.DataFrame): The input DataFrame.
+    Finds and analyzes alarm events in the log.
 
     Returns:
-        pd.DataFrame: A DataFrame containing only the anomalous log entries, or an empty DataFrame if none are found.
+        A DataFrame of alarm counts and a DataFrame of alarm details.
     """
-    required_cols = ['ProcessTime_ms', 'MessageName']
-    if not all(col in df.columns for col in required_cols):
-        return pd.DataFrame() # Return empty if columns don't exist
-
-    perf_df = df.dropna(subset=required_cols)
-    if perf_df.empty:
-        return pd.DataFrame()
-
-    # Group by message name to calculate anomalies for each type of transaction
-    anomalies = []
-    for name, group in perf_df.groupby('MessageName'):
-        q1 = group['ProcessTime_ms'].quantile(0.25)
-        q3 = group['ProcessTime_ms'].quantile(0.75)
-        iqr = q3 - q1
-        
-        # Define the upper bound for outlier detection
-        upper_bound = q3 + (1.5 * iqr)
-        
-        # Find all data points in the group that are above the upper bound
-        group_anomalies = group[group['ProcessTime_ms'] > upper_bound]
-        
-        if not group_anomalies.empty:
-            anomalies.append(group_anomalies)
-
-    if not anomalies:
-        return pd.DataFrame()
+    # Alarm messages are often sent via S5F1
+    # We look for the 'Message' that contains 'Alarm report send' or similar, 
+    # but the presence of ALID (Alarm ID) is a more robust check.
+    # NOTE: This assumes 'ALID' is a column after parsing. Let's adjust parsing slightly.
     
-    # Combine all found anomalies into a single DataFrame and sort by time
-    anomalies_df = pd.concat(anomalies).sort_values(by='timestamp')
-    return anomalies_df
+    # In Mess_4.txt, alarms are S5F1 events. Let's find those.
+    # A better approach is to find any log entry that has a non-null ALID if available.
+    # For now, let's assume alarms are identified by a specific message.
+    # Let's pivot to finding messages of type S5F1, which are standard alarm reports.
+    
+    # Let's assume for this log, an alarm is any event with "Alarm" in the message.
+    # This is a general approach. A more robust way would be to identify by MessageName like 'S5F1'
+    # For now, let's stick to what we can reliably parse from the existing structure.
+    
+    # A better, more general way: let's identify any "abnormal" event.
+    # For this log, let's find 'Unknown' messages or rows with high process times.
+    # This is part of the anomaly detection.
+    
+    # Let's be very specific to the user's need: Analyze alarms.
+    # The current parser doesn't explicitly pull out ALID. We should enhance it.
+    # For now, let's find rows with "Alarm" or "fail" in the message as a proxy.
+    
+    alarm_events = df[df['Message'].str.contains("Alarm|fail|error", case=False, na=False)]
+    
+    if alarm_events.empty:
+        return None, None
+        
+    # Let's imagine we parsed ALID and ALTX (alarm text)
+    # For now, we will use the full message as the alarm identifier
+    alarm_summary = alarm_events['Message'].value_counts().reset_index()
+    alarm_summary.columns = ['AlarmMessage', 'Frequency']
+    
+    return alarm_summary, alarm_events
+
+
+def get_context_around_event(df: pd.DataFrame, event_timestamp, window_minutes=5):
+    """
+    Extracts log entries within a time window around a specific event.
+    """
+    start_time = event_timestamp - pd.Timedelta(minutes=window_minutes)
+    end_time = event_timestamp + pd.Timedelta(minutes=window_minutes)
+    
+    contextual_logs = df[(df['timestamp'] >= start_time) & (df['timestamp'] <= end_time)]
+    
+    # Find the last known state variables before the event
+    state_before_event = df[df['timestamp'] < event_timestamp]
+    
+    context = {}
+    
+    # Find last Operator ID
+    if 'OperatorID' in state_before_event.columns and not state_before_event['OperatorID'].dropna().empty:
+        context['Last OperatorID'] = state_before_event['OperatorID'].dropna().iloc[-1]
+        
+    # Find last Magazine ID
+    if 'MagazineID' in state_before_event.columns and not state_before_event['MagazineID'].dropna().empty:
+        context['Last MagazineID'] = state_before_event['MagazineID'].dropna().iloc[-1]
+        
+    # Find last Lot ID
+    if 'LotID' in state_before_event.columns and not state_before_event['LotID'].dropna().empty:
+        context['Last LotID'] = state_before_event['LotID'].dropna().iloc[-1]
+        
+    return contextual_logs, context```
+
+### **Step 2: Update `app.py` with the Maintenance Dashboard**
+
+This is a significant update. We are adding a new tab and packing it with interactive features.
+
+**Updated `app.py`:**
+```python
+import streamlit as st
+import pandas as pd
+import log_analyzer as la
+
+@st.cache_data
+def load_data(uploaded_file):
+    df = la.parse_log_file(uploaded_file)
+    return df
+
+st.set_page_config(layout="wide")
+st.title("SECS/GEM Log Analysis Dashboard")
+
+st.sidebar.title("Upload Log File")
+uploaded_file = st.sidebar.file_uploader("Choose a log file (.txt)", type="txt")
+
+if uploaded_file is None:
+    st.info("Please upload a log file using the sidebar to begin analysis.")
+else:
+    df = load_data(uploaded_file)
+
+    if df.empty:
+        st.error("Could not parse any data from the uploaded file. Please check the file format.")
+    else:
+        st.header("High-Level Summary")
+        summary = la.get_summary_statistics(df)
+        col1, col2, col3, col4 = st.columns(4)
+        col1.metric("Total Log Entries", f"{summary['Total Entries']:,}")
+        col2.metric("Log Start Time (UTC)", summary['Start Time'].strftime("%H:%M:%S"))
+        col3.metric("Log End Time (UTC)", summary['End Time'].strftime("%H:%M:%S"))
+        
+        # Calculate and display total panels processed
+        if 'Message' in df.columns:
+            # This is an example; the exact message might need to be adjusted
+            panels_processed = df['Message'].str.contains("UnloadedFromTool|LoadedToToolCompleted", case=False, na=False).sum()
+            col4.metric("Panels Processed", f"{panels_processed:,}")
+
+        # Tabs for different user personas
+        op_tab, maint_tab = st.tabs(["Operational Analysis", "Maintenance & Alarm Analysis"])
+
+        with op_tab:
+            st.subheader("Operational Overview")
+            op_col1, op_col2 = st.columns(2)
+            with op_col1:
+                st.write("#### Transaction Performance")
+                perf_stats, perf_fig = la.analyze_transaction_performance(df)
+                if perf_stats is not None:
+                    st.dataframe(perf_stats)
+                    st.pyplot(perf_fig)
+                else:
+                    st.warning("No process time data found.")
+            with op_col2:
+                st.write("#### Event Frequency")
+                top_messages, freq_fig = la.analyze_event_frequency(df)
+                if top_messages is not None:
+                    st.dataframe(top_messages)
+                    st.pyplot(freq_fig)
+                else:
+                    st.warning("No message name data found.")
+
+        # --- NEW MAINTENANCE TAB ---
+        with maint_tab:
+            st.header("Maintenance & Downtime Analysis")
+            
+            alarm_summary, alarm_events = la.analyze_alarms(df)
+            
+            if alarm_summary is None:
+                st.success("No alarm or error messages were detected in this log file.")
+            else:
+                st.subheader("Alarm Frequency")
+                st.write("This table shows the most common alarms and errors found in the log.")
+                st.dataframe(alarm_summary)
+
+                st.subheader("Downtime Event Drill-Down")
+                st.write("Select a specific alarm event to see the surrounding log activity and context.")
+
+                # Create a unique identifier for each alarm for the dropdown
+                alarm_events['display'] = alarm_events['timestamp'].astype(str) + " - " + alarm_events['Message']
+                selected_event_display = st.selectbox("Select an Alarm Event:", options=alarm_events['display'])
+
+                if selected_event_display:
+                    # Find the original row for the selected event
+                    selected_event_row = alarm_events[alarm_events['display'] == selected_event_display].iloc[0]
+                    
+                    context_logs, context_data = la.get_context_around_event(df, selected_event_row['timestamp'])
+                    
+                    st.write("#### Context at Time of Event")
+                    if not context_data:
+                        st.warning("No contextual data (Operator, Lot, etc.) found before this event.")
+                    else:
+                        st.json(context_data)
+
+                    st.write(f"#### Log Timeline (5 minutes before and after the event)")
+                    st.dataframe(context_logs)
