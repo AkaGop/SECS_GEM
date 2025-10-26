@@ -25,7 +25,7 @@ def parse_log_file(uploaded_file) -> pd.DataFrame:
             # This logic robustly parses key=value pairs, even if values contain spaces.
             pairs = re.split(r'(\w+=)', details_str)[1:]
             details = dict(zip(pairs[0::2], pairs[1::2]))
-            details_cleaned = {k.replace('=', ''): v.strip() for k, v in details.items()}
+            details_cleaned = {k.replace('=', ''): v.strip().strip('"') for k, v in details.items()}
             
             log_entry.update(details_cleaned)
             del log_entry['details']
@@ -41,29 +41,27 @@ def clean_data(df: pd.DataFrame) -> pd.DataFrame:
     """
     Cleans, transforms, and enriches the DataFrame for analysis.
     """
-    # Convert timestamp column to datetime objects for time-series analysis
+    # Convert timestamp column to datetime objects
     df['timestamp'] = pd.to_datetime(df['timestamp'])
     
-    # Convert TransactionID to a numeric type, handling any parsing errors gracefully
+    # Convert TransactionID to a numeric type, handling errors
     if 'TransactionID' in df.columns:
         df['TransactionID'] = pd.to_numeric(df['TransactionID'], errors='coerce')
     
-    # Extract Process Time from the 'Message' column using regex
+    # Extract Process Time from the 'Message' column
     if 'Message' in df.columns:
         time_pattern = r"Process time of the transaction\(ID=\d+\) is ([\d.]+) msec"
         df['ProcessTime_ms'] = df['Message'].str.extract(time_pattern, expand=False).astype(float)
         
-    # Propagate 'MessageName' to all rows within the same transaction group.
-    # This is critical for linking process times to their specific message names.
+    # Propagate 'MessageName' across all rows within the same transaction group
     if 'TransactionID' in df.columns and 'MessageName' in df.columns:
         df = df.sort_values(by=['TransactionID', 'timestamp'])
-        # ffill() fills forward, bfill() fills backward. Doing both ensures all rows get the value.
         df['MessageName'] = df.groupby('TransactionID')['MessageName'].ffill().bfill()
         
     return df
 
 def get_summary_statistics(df: pd.DataFrame) -> dict:
-    """Returns a dictionary of high-level summary statistics from the log."""
+    """Returns a dictionary of high-level summary statistics."""
     if df.empty:
         return {}
     duration = df['timestamp'].max() - df['timestamp'].min()
@@ -75,9 +73,7 @@ def get_summary_statistics(df: pd.DataFrame) -> dict:
     }
 
 def analyze_transaction_performance(df: pd.DataFrame):
-    """
-    Analyzes transaction process times. Returns a statistics DataFrame and a matplotlib Figure.
-    """
+    """Analyzes transaction process times, returning stats and a figure."""
     required_cols = ['ProcessTime_ms', 'MessageName']
     if not all(col in df.columns for col in required_cols):
         return None, None
@@ -88,28 +84,24 @@ def analyze_transaction_performance(df: pd.DataFrame):
     
     performance_stats = perf_df.groupby('MessageName')['ProcessTime_ms'].describe()
     
-    # Create a boxplot visualization
     fig, ax = plt.subplots(figsize=(12, 8))
     sns.boxplot(ax=ax, data=perf_df, x='ProcessTime_ms', y='MessageName', 
                 order=performance_stats.sort_values('median', ascending=False).index)
     ax.set_title('Distribution of Process Times by Message Name')
     ax.set_xlabel('Process Time (ms)')
     ax.set_ylabel('Message Name')
-    ax.set_xscale('log') # Log scale is useful for wide-ranging time data
+    ax.set_xscale('log')
     plt.tight_layout()
     
     return performance_stats, fig
 
 def analyze_event_frequency(df: pd.DataFrame):
-    """
-    Analyzes message frequency. Returns the top message counts and a matplotlib Figure.
-    """
+    """Analyzes message frequency, returning counts and a figure."""
     if 'MessageName' not in df.columns:
         return None, None
         
     top_10_messages = df['MessageName'].value_counts().nlargest(10)
     
-    # Create a bar chart visualization
     fig, ax = plt.subplots(figsize=(12, 8))
     sns.barplot(ax=ax, y=top_10_messages.index, x=top_10_messages.values, orient='h')
     ax.set_title('Top 10 Most Frequent Message Names')
@@ -120,9 +112,7 @@ def analyze_event_frequency(df: pd.DataFrame):
     return top_10_messages, fig
 
 def analyze_transaction_lifecycle(df: pd.DataFrame) -> dict:
-    """
-    Finds transactions that were started ("added to queue") but never completed ("deleted from queue").
-    """
+    """Finds transactions that were started but never completed."""
     required_cols = ['Message', 'TransactionID']
     if not all(col in df.columns for col in required_cols):
         return {"error": "Lifecycle analysis requires 'Message' and 'TransactionID' columns."}
@@ -143,9 +133,7 @@ def analyze_transaction_lifecycle(df: pd.DataFrame) -> dict:
     }
 
 def detect_performance_anomalies(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Identifies performance anomalies using the Interquartile Range (IQR) method.
-    """
+    """Identifies performance anomalies using the IQR method."""
     required_cols = ['ProcessTime_ms', 'MessageName']
     if not all(col in df.columns for col in required_cols):
         return pd.DataFrame()
@@ -161,7 +149,6 @@ def detect_performance_anomalies(df: pd.DataFrame) -> pd.DataFrame:
         iqr = q3 - q1
         upper_bound = q3 + (1.5 * iqr)
         
-        # Any transaction taking longer than the upper bound is an anomaly
         group_anomalies = group[group['ProcessTime_ms'] > upper_bound]
         
         if not group_anomalies.empty:
@@ -170,15 +157,10 @@ def detect_performance_anomalies(df: pd.DataFrame) -> pd.DataFrame:
     if not anomalies:
         return pd.DataFrame()
     
-    anomalies_df = pd.concat(anomalies).sort_values(by='timestamp')
-    return anomalies_df
+    return pd.concat(anomalies).sort_values(by='timestamp')
 
 def analyze_alarms(df: pd.DataFrame):
-    """
-    Finds and summarizes alarm/error events from the log.
-    """
-    # A generic search for common error-related terms in the 'Message' column.
-    # This can be refined if specific alarm message names (e.g., S5F1) are more reliable.
+    """Finds and summarizes alarm/error events from the log."""
     alarm_events = df[df['Message'].str.contains("Alarm|fail|error", case=False, na=False)]
     
     if alarm_events.empty:
@@ -190,15 +172,12 @@ def analyze_alarms(df: pd.DataFrame):
     return alarm_summary, alarm_events
 
 def get_context_around_event(df: pd.DataFrame, event_timestamp, window_minutes=5):
-    """
-    Extracts log entries and key state data within a time window around a specific event.
-    """
+    """Extracts log entries and key state data within a time window around a specific event."""
     start_time = event_timestamp - pd.Timedelta(minutes=window_minutes)
     end_time = event_timestamp + pd.Timedelta(minutes=window_minutes)
     
     contextual_logs = df[(df['timestamp'] >= start_time) & (df['timestamp'] <= end_time)]
     
-    # Look for state data in the logs *before* the event happened
     state_before_event = df[df['timestamp'] < event_timestamp]
     
     context = {}
@@ -206,7 +185,6 @@ def get_context_around_event(df: pd.DataFrame, event_timestamp, window_minutes=5
     
     for identifier in key_identifiers:
         if identifier in state_before_event.columns and not state_before_event[identifier].dropna().empty:
-            # Get the very last non-null value for this identifier before the event
             context[f'Last Known {identifier}'] = state_before_event[identifier].dropna().iloc[-1]
             
     return contextual_logs, context
