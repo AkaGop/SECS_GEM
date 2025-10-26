@@ -160,9 +160,19 @@ def detect_performance_anomalies(df: pd.DataFrame) -> pd.DataFrame:
     return pd.concat(anomalies).sort_values(by='timestamp')
 
 def analyze_alarms(df: pd.DataFrame):
-    """Finds and summarizes alarm/error events from the log."""
-    alarm_events = df[df['Message'].str.contains("Alarm|fail|error", case=False, na=False)]
+    """
+    Finds and summarizes alarm/error events and critical anomalies from the log.
+    """
+    # Look for explicit errors OR messages containing "Unknown"
+    alarm_events = df[df['Message'].str.contains("Alarm|fail|error|Unknown", case=False, na=False)]
     
+    # Separately find impossible process times
+    if 'ProcessTime_ms' in df.columns:
+        negative_time_anomalies = df[df['ProcessTime_ms'] < 0]
+        if not negative_time_anomalies.empty:
+            # Combine both types of anomalies into one DataFrame
+            alarm_events = pd.concat([alarm_events, negative_time_anomalies]).drop_duplicates().sort_values(by='timestamp')
+
     if alarm_events.empty:
         return None, None
         
